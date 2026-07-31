@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "netscope"
 version = "1.0.0"
-description = "Educational web inspector for analyzing websites, technologies, and security"
+description = "Web inspector for analyzing websites, technologies, and security"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.13"
 authors = [
-    {name = "NetScope Team"}
+    {name = "MiVink"}
 ]
 keywords = ["security", "web", "inspector", "dns", "tls", "http", "scanner"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 1.0 - Release",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
@@ -42,9 +42,8 @@ dependencies = [
 netscope = "netscope.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/netscope/netscope-cli"
-Repository = "https://github.com/netscope/netscope-cli"
-Issues = "https://github.com/netscope/netscope-cli/issues"
+Homepage = "https://github.com/MiVink/NetScope"
+Repository = "https://github.com/MiVink/NetScope"
 
 [tool.setuptools.packages.find]
 where = ["."]
