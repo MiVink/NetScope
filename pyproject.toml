@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["security", "web", "inspector", "dns", "tls", "http", "scanner"]
 classifiers = [
-    "Development Status :: 1.0 - Release",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",

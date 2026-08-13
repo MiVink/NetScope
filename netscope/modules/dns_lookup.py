@@ -7,7 +7,7 @@ import dns.resolver
 import dns.exception
 
 from ..models import DNSRecord, IPInfo
-
+from ..config import DNS_TIMEOUT, DNS_LIFETIME
 
 async def scan(domain: str, max_retries: int = 3) -> List[DNSRecord]:
     """Perform comprehensive DNS lookup with retry support."""
@@ -18,8 +18,8 @@ async def scan(domain: str, max_retries: int = 3) -> List[DNSRecord]:
         for attempt in range(1, max_retries + 1):
             try:
                 resolver = dns.resolver.Resolver()
-                resolver.timeout = 5
-                resolver.lifetime = 5
+                resolver.timeout = DNS_TIMEOUT
+                resolver.lifetime = DNS_LIFETIME
 
                 answer = resolver.resolve(domain, rtype, raise_on_no_answer=False)
 

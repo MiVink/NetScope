@@ -47,7 +47,7 @@ pip install -r requirements.txt
 ### Option 1: pip install (recommended)
 
 ```bash
-git clone https://github.com/yourusername/netscope.git
+git clone https://github.com/MiVink/netscope.git
 cd netscope
 pip install -e .
 ```
@@ -61,7 +61,7 @@ netscope scan google.com
 ### Option 2: run without installing
 
 ```bash
-git clone https://github.com/yourusername/netscope.git
+git clone https://github.com/MiVink/netscope.git
 cd netscope
 ```
 

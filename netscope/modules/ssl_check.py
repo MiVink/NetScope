@@ -9,7 +9,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 
 from ..models import TLSInfo
-
+from ..config import TCP_TIMEOUT
 
 async def scan(domain: str, port: int = 443) -> TLSInfo:
     """Analyze TLS certificate and connection with detailed extensions."""
@@ -20,7 +20,7 @@ async def scan(domain: str, port: int = 443) -> TLSInfo:
     context.verify_mode = ssl.CERT_NONE  # Allow self-signed for inspection
 
     try:
-        with socket.create_connection((domain, port), timeout=10) as sock:
+        with socket.create_connection((domain, port), timeout=TCP_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 # TLS version
                 info.version = ssock.version()

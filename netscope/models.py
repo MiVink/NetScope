@@ -77,6 +77,7 @@ class TechnologyInfo:
     name: str
     category: str
     confidence: int = 100
+    evidence: Optional[str] = None
 
 
 @dataclass

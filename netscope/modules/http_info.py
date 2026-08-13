@@ -5,7 +5,7 @@ import time
 import httpx
 
 from ..models import RedirectInfo
-
+from ..config import HTTP_TIMEOUT
 
 async def scan(url: str) -> dict:
     """Fetch HTTP information with precise timing breakdown."""
@@ -26,7 +26,7 @@ async def scan(url: str) -> dict:
 
     async with httpx.AsyncClient(
         follow_redirects=True,
-        timeout=30.0,
+        timeout=HTTP_TIMEOUT,
         headers=headers,
         http2=True,
     ) as client:

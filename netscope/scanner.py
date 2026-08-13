@@ -23,6 +23,7 @@ from .utils import normalize_target, format_timestamp, PreciseTimer
 from .modules import dns_lookup, ssl_check, http_info, security_headers
 from .modules import cookies, robots, sitemap, favicon, compression
 from .modules import redirects, technologies, whois_lookup
+from .config import MAX_RETRIES
 
 console = Console()
 
@@ -112,7 +113,7 @@ class NetScopeScanner:
         self.result.errors.append(ErrorLog(module=module, error=error, is_warning=is_warning))
         self._log(f"ERROR [{module}]: {error}")
 
-    async def _run_module(self, name: str, coro, *args, max_retries: int = 3, **kwargs):
+    async def _run_module(self, name: str, coro, *args, max_retries: int = MAX_RETRIES, **kwargs):
         """Run a module with retry logic and timeout handling."""
         for attempt in range(1, max_retries + 1):
             try:
