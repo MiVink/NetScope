@@ -17,11 +17,12 @@ jobs:
           python-version: '3.13'
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest black flake8
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest flake8 black
       - name: Lint with flake8
-        run: flake8 netscope/ --max-line-length=120 --exclude=__pycache__
+        run: flake8 netscope/ tests/ --max-line-length=120 --exclude=__pycache__
       - name: Format check with black
-        run: black --check netscope/
+        run: black --check netscope/ tests/
       - name: Run tests
-        run: pytest tests/ -v || true
+        run: pytest -v

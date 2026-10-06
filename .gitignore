@@ -9,3 +9,9 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Scan output
+scan.log
+reports/

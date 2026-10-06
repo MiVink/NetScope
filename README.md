@@ -14,7 +14,8 @@ Web inspector for analyzing websites, technologies, security posture, and infras
 - **Cookie Analysis** — Secure, HttpOnly, SameSite flags
 - **robots.txt & sitemap.xml** — parsing and analysis
 - **Favicon Detection** — hash and file type
-- **Technology Detection** — evidence-based matching with no false positives
+- **Technology Detection** — evidence-based matching (headers + body patterns)
+- **Certificate Validation** — real chain/hostname verdict, not just inspection
 - **Compression** — gzip, brotli, deflate support
 - **Response Timeline** — precise DNS / TCP / TLS / TTFB / Download / Total timing
 - **Additional Information** — ALPN, Keep-Alive, HTTP/3, OCSP, Alt-Svc
@@ -26,17 +27,15 @@ Web inspector for analyzing websites, technologies, security posture, and infras
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.10+
 - httpx[http2]
 - rich
 - typer
 - dnspython
 - cryptography
-- beautifulsoup4
-- tldextract
 - python-whois
 
-Install dependencies manually:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -63,6 +62,7 @@ netscope scan google.com
 ```bash
 git clone https://github.com/MiVink/netscope.git
 cd netscope
+pip install -r requirements.txt
 ```
 
 Then use one of these methods:
@@ -79,12 +79,9 @@ python -m netscope.cli scan google.com
 python netscope/main.py scan google.com
 ```
 
-**Via direct execution:**
-
-```bash
-cd netscope
-python cli.py scan google.com
-```
+> Note: run these from the repository root. `python cli.py` (inside the
+> package directory) is not supported because the package relies on relative
+> imports.
 
 ## Usage
 
@@ -113,19 +110,22 @@ netscope scan google.com --verbose --raw --export "./reports" --log
 
 ## Project Structure
 
-```Structure
+```
 NetScope/                          # Repository root
 ├── pyproject.toml                 # Package configuration
 ├── README.md                      # This file
 ├── CHANGELOG.md                   # Version history
 ├── requirements.txt               # Dependencies
+├── tests/                         # pytest test suite
+├── .github/workflows/ci.yml       # Lint + format + test CI
 └── netscope/                      # Python package
-    ├── __init__.py
-    ├── main.py                    # Entry point
+    ├── __init__.py                # Package version
+    ├── main.py                    # Entry point (script-friendly)
     ├── cli.py                     # CLI interface (Typer)
     ├── scanner.py                 # Main orchestrator
     ├── models.py                  # Data models
-    ├── utils.py                   # Utilities (retry, timer, normalization)
+    ├── config.py                  # Timeouts, retries, size limits
+    ├── utils.py                   # Utilities (normalization, timer)
     └── modules/                   # Analysis modules
         ├── __init__.py
         ├── dns_lookup.py
@@ -142,6 +142,15 @@ NetScope/                          # Repository root
         └── whois_lookup.py
 ```
 
+## Development
+
+```bash
+pip install -e ".[dev]"
+flake8 netscope/ tests/ --max-line-length=120
+black netscope/ tests/
+pytest
+```
+
 ## License
 
-MIT License.
+MIT License — see [LICENSE](LICENSE).
