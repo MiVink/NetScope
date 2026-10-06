@@ -1,14 +1,17 @@
-""" HTTP information gathering module with precise timing. """
+"""HTTP information gathering module with precise timing."""
 
-import asyncio
 import time
 import httpx
 
-from ..models import RedirectInfo
 from ..config import HTTP_TIMEOUT
 
+
 async def scan(url: str) -> dict:
-    """Fetch HTTP information with precise timing breakdown."""
+    """Fetch HTTP information with precise timing breakdown.
+
+    Note: ttfb_ms is measured from the moment the request is issued and
+    therefore includes connection establishment (and TLS for https).
+    """
     headers = {
         "User-Agent": "NetScope/1.0 (Web Inspector)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -17,12 +20,12 @@ async def scan(url: str) -> dict:
         "Connection": "keep-alive",
     }
 
-    # Use httpx with http2 for accurate protocol detection
-    # For precise TTFB, we measure time to first byte of response headers
-
     total_start = time.perf_counter()
     ttfb_ms = None
     download_ms = None
+    total_ms = None
+    content = b""
+    response = None
 
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -30,14 +33,13 @@ async def scan(url: str) -> dict:
         headers=headers,
         http2=True,
     ) as client:
-        # Stream the response to measure TTFB accurately
+        # Stream the response so timing reflects headers vs. body separately
         async with client.stream("GET", url) as response:
-            # TTFB = time until first byte of response headers received
+            # First byte of response headers received
             ttfb_end = time.perf_counter()
             ttfb_ms = (ttfb_end - total_start) * 1000
 
             # Read the body
-            content = b""
             async for chunk in response.aiter_bytes():
                 content += chunk
 
@@ -45,17 +47,25 @@ async def scan(url: str) -> dict:
             total_ms = (total_end - total_start) * 1000
             download_ms = max(0, total_ms - ttfb_ms)
 
-    # Detect HTTP version
-    http_version = "HTTP/1.1"
-    if hasattr(response, "http_version"):
-        version_raw = response.http_version
-        if version_raw == "HTTP/2":
-            http_version = "HTTP/2"
-        elif version_raw == "HTTP/1.1":
-            http_version = "HTTP/1.1"
+    if response is None:  # pragma: no cover - stream always binds it
+        raise RuntimeError("No HTTP response received")
 
-    # Extract additional info from headers
+    # Detect HTTP version (httpx reports "HTTP/1.1", "HTTP/2", "HTTP/3")
+    version_raw = getattr(response, "http_version", "") or ""
+    http_version = version_raw if version_raw.startswith("HTTP/") else "HTTP/1.1"
+
     all_headers = dict(response.headers)
+
+    # Actual request as sent (used by --raw display)
+    request = response.request
+    request_headers = dict(request.headers)
+
+    # Prefer the declared Content-Length; fall back to the decoded body size
+    declared_length = all_headers.get("content-length")
+    try:
+        content_length = int(declared_length) if declared_length is not None else len(content)
+    except (TypeError, ValueError):
+        content_length = len(content)
 
     return {
         "http_version": http_version,
@@ -65,11 +75,16 @@ async def scan(url: str) -> dict:
         "download_ms": download_ms,
         "final_url": str(response.url),
         "server": all_headers.get("server"),
-        "content_length": len(content),
+        "content_length": content_length,
+        "body_bytes": len(content),
         "content_type": all_headers.get("content-type"),
         "headers": all_headers,
+        "headers_list": response.headers.multi_items(),
         "content_encoding": all_headers.get("content-encoding"),
         "transfer_encoding": all_headers.get("transfer-encoding"),
         "keep_alive": all_headers.get("keep-alive"),
         "alt_svc": all_headers.get("alt-svc"),
+        "request_method": request.method,
+        "request_url": str(request.url),
+        "request_headers": request_headers,
     }

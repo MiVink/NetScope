@@ -1,48 +1,49 @@
-""" Cookie inspection module. """
+"""Cookie inspection module."""
 
-import httpx
-from typing import List
+from typing import List, Iterable, Tuple
 from ..models import CookieInfo
 
 
-async def scan(url: str) -> List[CookieInfo]:
-    """Inspect cookies from HTTP response."""
-    cookies = []
+def parse_set_cookie(cookie_str: str) -> CookieInfo | None:
+    """Parse a single Set-Cookie header value into CookieInfo."""
+    if not cookie_str or "=" not in cookie_str.split(";")[0]:
+        return None
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, http2=True) as client:
-        response = await client.get(url)
+    parts = cookie_str.split(";")
+    name, sep, value = parts[0].strip().partition("=")
+    if not name or not sep:
+        return None
 
-    # Parse Set-Cookie headers
-    set_cookie_headers = response.headers.get_list("set-cookie") if hasattr(response.headers, "get_list") else []
-    if not set_cookie_headers:
-        # Fallback for httpx
-        raw_cookies = response.headers.get("set-cookie", "")
-        if raw_cookies:
-            set_cookie_headers = [raw_cookies]
+    cookie = CookieInfo(name=name, value=value)
 
-    for cookie_str in set_cookie_headers:
-        if not cookie_str:
-            continue
+    for part in parts[1:]:
+        attr = part.strip()
+        key, eq, val = attr.partition("=")
+        key_l = key.strip().lower()
+        val = val.strip() if eq else ""
 
-        parts = cookie_str.split(";")
-        name_value = parts[0].strip()
-        name = name_value.split("=")[0] if "=" in name_value else name_value
+        if key_l == "secure":
+            cookie.secure = True
+        elif key_l == "httponly":
+            cookie.httponly = True
+        elif key_l == "samesite":
+            cookie.samesite = val.capitalize() if val else None
+        elif key_l == "expires":
+            cookie.expires = val
+        elif key_l == "domain":
+            cookie.domain = val.lstrip(".").lower() or None
+        elif key_l == "path":
+            cookie.path = val or "/"
 
-        cookie = CookieInfo(name=name)
+    return cookie
 
-        for part in parts[1:]:
-            part = part.strip().lower()
-            if part.startswith("secure"):
-                cookie.secure = True
-            elif part.startswith("httponly"):
-                cookie.httponly = True
-            elif part.startswith("samesite="):
-                cookie.samesite = part.split("=")[1].capitalize()
-            elif part.startswith("expires="):
-                cookie.expires = part.split("=", 1)[1]
-            elif part.startswith("domain="):
-                cookie.domain = part.split("=", 1)[1]
 
-        cookies.append(cookie)
-
+def parse_headers(headers: Iterable[Tuple[str, str]]) -> List[CookieInfo]:
+    """Extract cookies from a raw (name, value) header list."""
+    cookies: List[CookieInfo] = []
+    for name, value in headers:
+        if name.lower() == "set-cookie":
+            cookie = parse_set_cookie(value)
+            if cookie:
+                cookies.append(cookie)
     return cookies

@@ -1,4 +1,4 @@
-""" Data models """
+"""Data models"""
 
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
@@ -41,8 +41,9 @@ class TLSInfo:
     days_remaining: Optional[int] = None
     fingerprint: Optional[str] = None
     alpn: Optional[str] = None
-    ocsp_stapling: Optional[bool] = None
-    session_resumption: Optional[bool] = None
+    # Certificate chain validation (None = not checked / could not check)
+    chain_valid: Optional[bool] = None
+    verify_error: Optional[str] = None
 
 
 @dataclass
@@ -63,6 +64,8 @@ class CookieInfo:
     samesite: Optional[str] = None
     expires: Optional[str] = None
     domain: Optional[str] = None
+    path: Optional[str] = None
+    value: Optional[str] = None
 
 
 @dataclass
@@ -92,13 +95,9 @@ class ResponseTimeline:
 
 @dataclass
 class AdditionalInfo:
-    alpn: Optional[str] = None
     keep_alive: Optional[str] = None
     http3_support: Optional[bool] = None
-    ocsp_stapling: Optional[bool] = None
-    session_resumption: Optional[bool] = None
     alt_svc: Optional[str] = None
-    connection_reuse: Optional[bool] = None
     content_encoding: Optional[str] = None
     transfer_encoding: Optional[str] = None
 
@@ -137,3 +136,11 @@ class ScanResult:
     timeline: Optional[ResponseTimeline] = None
     additional_info: Optional[AdditionalInfo] = None
     errors: List[ErrorLog] = field(default_factory=list)
+    # Actual request that was sent (used by --raw display)
+    request_method: str = "GET"
+    request_url: Optional[str] = None
+    request_headers: Dict[str, str] = field(default_factory=dict)
+    # Raw header list, preserving duplicates (e.g. multiple Set-Cookie)
+    headers_list: List[tuple] = field(default_factory=list)
+    # Page body for technology detection (bounded by MAX_BODY_SIZE)
+    page_body: str = ""

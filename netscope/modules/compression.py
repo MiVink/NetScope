@@ -1,33 +1,29 @@
-""" HTTP compression detection module. """
+"""HTTP compression detection module."""
 
 import httpx
 from typing import List
 
+from ..config import MODULE_TIMEOUT
+
 
 async def scan(url: str) -> List[str]:
-    """Detect supported compression methods."""
+    """Detect supported compression methods via Accept-Encoding negotiation."""
     supported = []
+    encodings = ["gzip", "deflate", "br", "zstd"]
+    display = {"br": "brotli"}
 
-    # Check via Accept-Encoding negotiation
-    encodings = ["gzip", "br", "deflate"]
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=MODULE_TIMEOUT) as client:
         for enc in encodings:
             try:
-                headers = {"Accept-Encoding": enc}
-                response = await client.get(url, headers=headers)
-                ce = response.headers.get("content-encoding", "").lower()
-                if enc in ce or (enc == "br" and "br" in ce):
-                    supported.append(enc)
+                response = await client.get(url, headers={"Accept-Encoding": enc})
+                # Server answers with exactly the encoding it used (or none)
+                applied = [
+                    e.strip().lower() for e in response.headers.get("content-encoding", "").split(",") if e.strip()
+                ]
+                if enc in applied:
+                    supported.append(display.get(enc, enc))
             except Exception:
                 continue
 
-    # Deduplicate and rename br -> brotli
-    result = []
-    for s in supported:
-        if s == "br":
-            result.append("brotli")
-        elif s not in result:
-            result.append(s)
-
-    return result
+    # Preserve order, drop duplicates
+    return list(dict.fromkeys(supported))

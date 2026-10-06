@@ -1,21 +1,19 @@
-""" Main scanner orchestrator with step-by-step output. """
+"""Main scanner orchestrator with step-by-step output."""
 
 import asyncio
+import socket
 import time
-import sys
-import os
 from datetime import datetime
 from typing import Optional, Dict, List
-from contextlib import contextmanager
 
 from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from rich.table import Table
 
 from .models import (
-    ScanResult, DNSRecord, ResponseTimeline, 
-    AdditionalInfo, ErrorLog, TLSInfo
+    ScanResult,
+    DNSRecord,
+    ResponseTimeline,
+    AdditionalInfo,
+    ErrorLog,
 )
 from .utils import normalize_target, format_timestamp, PreciseTimer
 
@@ -23,26 +21,23 @@ from .utils import normalize_target, format_timestamp, PreciseTimer
 from .modules import dns_lookup, ssl_check, http_info, security_headers
 from .modules import cookies, robots, sitemap, favicon, compression
 from .modules import redirects, technologies, whois_lookup
-from .config import MAX_RETRIES
-
-console = Console()
-
-
-class ScanCancelled(Exception):
-    """Raised when user cancels scan via Ctrl+C."""
-    pass
+from .config import MAX_RETRIES, MODULE_TIMEOUT, HTTP_TIMEOUT, TCP_TIMEOUT, RETRY_BACKOFF
 
 
 class NetScopeScanner:
     """Orchestrates all scanning modules with real-time step output."""
 
     def __init__(self, verbose: bool = False, log_file: Optional[str] = None):
-        self.result = ScanResult(target="")
         self.console = Console()
         self.verbose = verbose
         self.log_file = log_file
         self._log_lines: List[str] = []
+        self.result = ScanResult(target="")
+        self.is_https = True
+        self._tls_checked = False
         self._timeline = ResponseTimeline()
+
+    # ─── Logging helpers ────────────────────────────────────────────
 
     def _log(self, message: str):
         """Internal log collector for --log mode."""
@@ -60,8 +55,7 @@ class NetScopeScanner:
 
     def _log_step(self, message: str, style: str = "cyan"):
         """Print a timestamped step message."""
-        timestamp = format_timestamp()
-        line = f"{timestamp} {message}"
+        line = f"{format_timestamp()} {message}"
         self.console.print(line, style=style)
         self._log(line)
 
@@ -109,63 +103,93 @@ class NetScopeScanner:
         return grouped
 
     def _record_error(self, module: str, error: str, is_warning: bool = False):
-        """Record an error for the error summary."""
+        """Record an error for the error summary (long messages are trimmed)."""
+        error = " ".join(str(error).split())  # collapse newlines/whitespace
+        if len(error) > 300:
+            error = error[:297] + "..."
         self.result.errors.append(ErrorLog(module=module, error=error, is_warning=is_warning))
         self._log(f"ERROR [{module}]: {error}")
 
-    async def _run_module(self, name: str, coro, *args, max_retries: int = MAX_RETRIES, **kwargs):
+    # ─── Module runner ──────────────────────────────────────────────
+
+    async def _run_module(
+        self, name: str, coro, *args, max_retries: int = MAX_RETRIES, timeout: float = MODULE_TIMEOUT, **kwargs
+    ):
         """Run a module with retry logic and timeout handling."""
         for attempt in range(1, max_retries + 1):
             try:
-                return await asyncio.wait_for(coro(*args, **kwargs), timeout=30)
+                return await asyncio.wait_for(coro(*args, **kwargs), timeout=timeout)
             except asyncio.TimeoutError:
                 if attempt < max_retries:
                     self._log_retry(attempt, max_retries)
-                    await asyncio.sleep(0.5 * attempt)
+                    await asyncio.sleep(RETRY_BACKOFF * attempt)
                     continue
-                self._record_error(name, "Timeout")
+                self._record_error(name, f"Timeout after {timeout:.0f}s")
                 raise
             except Exception as e:
                 error_str = str(e).lower()
                 # Don't retry permanent errors
-                permanent = ["nxdomain", "noanswer", "nonameservers", "nodename", 
-                            "not known", "invalid", "refused", "no such file"]
+                permanent = [
+                    "nxdomain",
+                    "noanswer",
+                    "nonameservers",
+                    "nodename",
+                    "not known",
+                    "invalid",
+                    "refused",
+                    "no such file",
+                    "no match",
+                    "not found",
+                    "no entries",
+                    "does not exist",
+                    "getaddrinfo failed",
+                    "name or service not known",
+                    "temporary failure in name resolution",
+                ]
                 if any(p in error_str for p in permanent):
                     self._record_error(name, str(e))
                     raise
                 if attempt < max_retries:
                     self._log_retry(attempt, max_retries)
-                    await asyncio.sleep(0.5 * attempt)
+                    await asyncio.sleep(RETRY_BACKOFF * attempt)
                     continue
                 self._record_error(name, str(e))
                 raise
 
-    async def scan(self, target: str, raw_mode: bool = False, export_dir: Optional[str] = None):
-        """Run full scan with step-by-step output."""
+    # ─── Scan ───────────────────────────────────────────────────────
+
+    async def scan(self, target: str, raw_mode: bool = False, export_dir: Optional[str] = None) -> bool:
+        """Run full scan with step-by-step output.
+
+        Returns True when the core scan (DNS + HTTP) succeeded.
+        """
         try:
-            await self._do_scan(target, raw_mode, export_dir)
-        except ScanCancelled:
-            self.console.print()
-            self.console.print("[yellow]Scan cancelled.[/yellow]")
-            self.console.print("[dim]Cleaning up...[/dim]")
-            self._save_log()
-            self.console.print("[dim]Done.[/dim]")
-            sys.exit(0)
+            return await self._do_scan(target, raw_mode, export_dir)
         except KeyboardInterrupt:
             self.console.print()
             self.console.print("[yellow]Scan cancelled.[/yellow]")
             self.console.print("[dim]Cleaning up...[/dim]")
             self._save_log()
             self.console.print("[dim]Done.[/dim]")
-            sys.exit(0)
+            raise
+        except Exception as e:
+            # Never leak a traceback: report and still save the log
+            self._log_error(f"Scan aborted: {e}")
+            self._record_error("Scanner", str(e))
+            self._save_log()
+            return False
 
-    async def _do_scan(self, target: str, raw_mode: bool = False, export_dir: Optional[str] = None):
-        """Internal scan implementation."""
+    async def _do_scan(self, target: str, raw_mode: bool = False, export_dir: Optional[str] = None) -> bool:
+        """Internal scan implementation. Returns True on success."""
         domain, full_url, is_https = normalize_target(target)
-        self.result.target = domain
+
+        # Fresh state for every run
+        self.result = ScanResult(target=domain)
+        self.is_https = is_https
+        self._tls_checked = False
+        self._timeline = ResponseTimeline()
 
         total_start = time.perf_counter()
-
         self._log_step(f"Target: {domain}", "dim")
 
         # ─── DNS ───
@@ -174,7 +198,11 @@ class NetScopeScanner:
             try:
                 dns_records = await self._run_module("DNS", dns_lookup.scan, domain)
                 self.result.dns_records = dns_records
-                self._log_success(f"DNS resolved ({len(dns_records)} records)")
+                if dns_records:
+                    self._log_success(f"DNS resolved ({len(dns_records)} records)")
+                else:
+                    self._log_warning("No DNS records found")
+                    self._record_error("DNS", "No DNS records found", is_warning=True)
             except Exception as e:
                 self._log_error(f"DNS lookup failed: {e}")
         self._timeline.dns_lookup_ms = t.elapsed_ms
@@ -186,6 +214,8 @@ class NetScopeScanner:
             self.result.ip_info = ip_info
             if ip_info.ipv4 or ip_info.ipv6:
                 self._log_success("IP information retrieved")
+            else:
+                self._log_warning("No IP addresses resolved")
         except Exception as e:
             self._log_error(f"IP analysis failed: {e}")
 
@@ -196,41 +226,51 @@ class NetScopeScanner:
             self.result.whois = whois_info
             if whois_info.registrar:
                 self._log_success("WHOIS data retrieved")
+            else:
+                self._log_warning("WHOIS returned no registrar data")
         except Exception as e:
             self._log_error(f"WHOIS lookup failed: {e}")
 
         # ─── TCP Connection ───
+        # A failed pre-check must not abort the scan: HTTP/TLS modules report
+        # their own, more precise errors.
+        tcp_ok = False
         self._log_step("Opening TCP connection...")
         with PreciseTimer() as t:
+            port = 443 if is_https else 80
             try:
-                import socket
-                port = 443 if is_https else 80
-                sock = socket.create_connection((domain, port), timeout=10)
-                self._log_success(f"Connected to {domain}:{port}")
+                sock = await asyncio.to_thread(socket.create_connection, (domain, port), TCP_TIMEOUT)
                 sock.close()
+                tcp_ok = True
+                self._log_success(f"Connected to {domain}:{port}")
             except Exception as e:
                 self._log_error(f"TCP connection failed: {e}")
                 self._record_error("TCP", str(e))
-                return
         self._timeline.tcp_connect_ms = t.elapsed_ms
 
         # ─── TLS Handshake ───
         if is_https:
+            self._tls_checked = True
             self._log_step("Performing TLS handshake...")
             with PreciseTimer() as t:
                 try:
                     tls_info = await self._run_module("TLS", ssl_check.scan, domain)
                     self.result.tls = tls_info
                     if tls_info.version:
-                        self._log_success(f"{tls_info.version} established")
+                        suffix = ""
+                        if tls_info.chain_valid is False:
+                            suffix = " [red](certificate INVALID)[/red]"
+                        self._log_success(f"{tls_info.version} established{suffix}")
                 except Exception as e:
                     self._log_error(f"TLS handshake failed: {e}")
             self._timeline.tls_handshake_ms = t.elapsed_ms
+        elif tcp_ok:
+            self._log_info("Plaintext HTTP target — TLS skipped")
 
         # ─── HTTP Request ───
         self._log_step("Sending HTTP request...")
         try:
-            http_data = await self._run_module("HTTP", http_info.scan, full_url)
+            http_data = await self._run_module("HTTP", http_info.scan, full_url, timeout=HTTP_TIMEOUT)
             self.result.http_version = http_data.get("http_version")
             self.result.status_code = http_data.get("status_code")
             self.result.response_time_ms = http_data.get("response_time_ms")
@@ -239,9 +279,17 @@ class NetScopeScanner:
             self.result.content_length = http_data.get("content_length")
             self.result.content_type = http_data.get("content_type")
             self.result.all_headers = http_data.get("headers", {})
+            self.result.headers_list = http_data.get("headers_list", [])
+            self.result.request_method = http_data.get("request_method", "GET")
+            self.result.request_url = http_data.get("request_url")
+            self.result.request_headers = http_data.get("request_headers", {})
 
             self._timeline.ttfb_ms = http_data.get("ttfb_ms")
             self._timeline.download_ms = http_data.get("download_ms")
+
+            # Judge HTTPS by where we actually ended up, not by the input scheme:
+            # http://target may redirect to https://target.
+            self.is_https = (self.result.final_url or full_url).lower().startswith("https")
 
             # Build AdditionalInfo from HTTP headers
             add_info = AdditionalInfo()
@@ -258,11 +306,9 @@ class NetScopeScanner:
             self._log_success(f"{version} {status}")
         except Exception as e:
             self._log_error(f"HTTP request failed: {e}")
-            return
-
-        total_end = time.perf_counter()
-        self._timeline.total_ms = (total_end - total_start) * 1000
-        self.result.timeline = self._timeline
+            # Produce a partial report instead of exiting silently
+            self._finish_scan(total_start, raw_mode, export_dir)
+            return False
 
         # ─── Redirects ───
         self._log_step("Analyzing redirect chain...")
@@ -270,7 +316,7 @@ class NetScopeScanner:
             redirects_data = await self._run_module("Redirects", redirects.scan, full_url)
             self.result.redirect_chain = redirects_data
             if len(redirects_data) > 1:
-                self._log_success(f"{len(redirects_data)} redirects traced")
+                self._log_success(f"{len(redirects_data) - 1} redirect(s) traced")
             else:
                 self._log_success("No redirects")
         except Exception as e:
@@ -298,10 +344,10 @@ class NetScopeScanner:
         except Exception as e:
             self._log_error(f"Security header analysis failed: {e}")
 
-        # ─── Cookies ───
+        # ─── Cookies (from the already-fetched response headers) ───
         self._log_step("Inspecting cookies...")
         try:
-            cookies_data = await self._run_module("Cookies", cookies.scan, full_url)
+            cookies_data = cookies.parse_headers(self.result.headers_list)
             self.result.cookies = cookies_data
             if cookies_data:
                 self._log_success(f"{len(cookies_data)} cookie(s) found")
@@ -349,9 +395,13 @@ class NetScopeScanner:
         # ─── Technology Detection ───
         self._log_step("Detecting technologies...")
         try:
-            techs = await self._run_module("Technologies", technologies.scan, 
-                                          full_url, self.result.all_headers, 
-                                          self.result.server_header or "")
+            techs = await self._run_module(
+                "Technologies",
+                technologies.scan,
+                full_url,
+                self.result.all_headers,
+                self.result.server_header or "",
+            )
             self.result.technologies = techs
             if techs:
                 self._log_success(f"{len(techs)} technology(s) detected")
@@ -360,10 +410,19 @@ class NetScopeScanner:
         except Exception as e:
             self._log_error(f"Technology detection failed: {e}")
 
-        # ─── Generate Report ───
+        self._finish_scan(total_start, raw_mode, export_dir)
+        return True
+
+    def _finish_scan(self, total_start: float, raw_mode: bool, export_dir: Optional[str]):
+        """Common tail: finalize timeline, render report, save log."""
+        self._timeline.total_ms = (time.perf_counter() - total_start) * 1000
+        self.result.timeline = self._timeline
+
         self._log_step("Generating report...")
         self._display_report(raw_mode=raw_mode, export_dir=export_dir)
         self._save_log()
+
+    # ─── Report ─────────────────────────────────────────────────────
 
     def _display_report(self, raw_mode: bool = False, export_dir: Optional[str] = None):
         """Display final report with sections."""
@@ -380,30 +439,29 @@ class NetScopeScanner:
                 if rtype in grouped:
                     recs = grouped[rtype]
                     self.console.print(f"[bold cyan]{rtype} Records[/bold cyan] ({len(recs)})")
-                    if self.verbose:
-                        for rec in recs:
-                            ttl_str = f" (TTL: {rec.ttl})" if rec.ttl else ""
-                            self.console.print(f"  {rec.value}{ttl_str}")
-                    else:
-                        # Compact: show count and first 3
-                        for rec in recs[:3]:
-                            ttl_str = f" (TTL: {rec.ttl})" if rec.ttl else ""
-                            self.console.print(f"  {rec.value}{ttl_str}")
-                        if len(recs) > 3:
-                            self.console.print(f"  ... and {len(recs) - 3} more")
+                    shown = recs if self.verbose else recs[:3]
+                    for rec in shown:
+                        ttl_str = f" (TTL: {rec.ttl})" if rec.ttl else ""
+                        self.console.print(f"  {rec.value}{ttl_str}")
+                    if not self.verbose and len(recs) > 3:
+                        self.console.print(f"  ... and {len(recs) - 3} more")
 
         if self.result.ip_info:
             ip = self.result.ip_info
             if ip.ipv4:
                 self.console.print(f"[bold cyan]IPv4[/bold cyan] ({len(ip.ipv4)})")
-                for addr in ip.ipv4[:3] if not self.verbose else ip.ipv4:
+                shown = ip.ipv4 if self.verbose else ip.ipv4[:3]
+                for addr in shown:
                     self.console.print(f"  {addr}")
                 if not self.verbose and len(ip.ipv4) > 3:
                     self.console.print(f"  ... and {len(ip.ipv4) - 3} more")
             if ip.ipv6:
                 self.console.print(f"[bold cyan]IPv6[/bold cyan] ({len(ip.ipv6)})")
-                for addr in ip.ipv6[:2] if not self.verbose else ip.ipv6:
+                shown = ip.ipv6 if self.verbose else ip.ipv6[:2]
+                for addr in shown:
                     self.console.print(f"  {addr}")
+                if not self.verbose and len(ip.ipv6) > 2:
+                    self.console.print(f"  ... and {len(ip.ipv6) - 2} more")
             if ip.asn:
                 self.console.print(f"[bold cyan]ASN[/bold cyan] {ip.asn}")
             if ip.provider:
@@ -421,7 +479,8 @@ class NetScopeScanner:
             if w.expiration_date:
                 self.console.print(f"[bold cyan]Expires[/bold cyan] {w.expiration_date.strftime('%Y-%m-%d')}")
             if w.name_servers:
-                self.console.print(f"[bold cyan]Name Servers[/bold cyan] {', '.join(w.name_servers[:4])}")
+                ns = ", ".join(w.name_servers[:4])
+                self.console.print(f"[bold cyan]Name Servers[/bold cyan] {ns}")
 
         # ═══════════════════════════════════════
         # HTTP
@@ -430,16 +489,17 @@ class NetScopeScanner:
 
         if self.result.http_version:
             self.console.print(f"[bold cyan]Version[/bold cyan] {self.result.http_version}")
-        if self.result.status_code:
-            status_color = "green" if self.result.status_code < 400 else "yellow" if self.result.status_code < 500 else "red"
-            self.console.print(f"[bold cyan]Status[/bold cyan] [{status_color}]{self.result.status_code}[/{status_color}]")
-        if self.result.response_time_ms:
+        if self.result.status_code is not None:
+            code = self.result.status_code
+            status_color = "green" if code < 400 else "yellow" if code < 500 else "red"
+            self.console.print(f"[bold cyan]Status[/bold cyan] [{status_color}]{code}[/{status_color}]")
+        if self.result.response_time_ms is not None:
             self.console.print(f"[bold cyan]Response Time[/bold cyan] {self.result.response_time_ms:.2f} ms")
         if self.result.final_url:
             self.console.print(f"[bold cyan]Final URL[/bold cyan] {self.result.final_url}")
         if self.result.server_header:
             self.console.print(f"[bold cyan]Server[/bold cyan] {self.result.server_header}")
-        if self.result.content_length:
+        if self.result.content_length is not None:
             self.console.print(f"[bold cyan]Content Length[/bold cyan] {self.result.content_length} bytes")
         if self.result.content_type:
             self.console.print(f"[bold cyan]Content Type[/bold cyan] {self.result.content_type}")
@@ -478,14 +538,15 @@ class NetScopeScanner:
             if tls.days_remaining is not None:
                 color = "green" if tls.days_remaining > 30 else "yellow" if tls.days_remaining > 7 else "red"
                 self.console.print(f"[bold cyan]Days Remaining[/bold cyan] [{color}]{tls.days_remaining}[/{color}]")
+            if tls.chain_valid is not None:
+                if tls.chain_valid:
+                    self.console.print("[bold cyan]Certificate[/bold cyan] [green]Valid[/green]")
+                else:
+                    err = f" — {tls.verify_error}" if tls.verify_error else ""
+                    self.console.print(f"[bold cyan]Certificate[/bold cyan] [red]INVALID[/red]{err}")
             if tls.fingerprint:
-                self.console.print(f"[bold cyan]SHA256 Fingerprint[/bold cyan]")
+                self.console.print("[bold cyan]SHA256 Fingerprint[/bold cyan]")
                 self.console.print(f"  {tls.fingerprint}")
-            if self.verbose:
-                if tls.ocsp_stapling is not None:
-                    self.console.print(f"[bold cyan]OCSP Stapling[/bold cyan] {'Yes' if tls.ocsp_stapling else 'No'}")
-                if tls.session_resumption is not None:
-                    self.console.print(f"[bold cyan]Session Resumption[/bold cyan] {'Yes' if tls.session_resumption else 'No'}")
 
         # ═══════════════════════════════════════
         # SECURITY AUDIT
@@ -501,9 +562,12 @@ class NetScopeScanner:
             cookie_list = self.result.cookies if self.verbose else self.result.cookies[:5]
             for c in cookie_list:
                 flags = []
-                if c.secure: flags.append("Secure")
-                if c.httponly: flags.append("HttpOnly")
-                if c.samesite: flags.append(f"SameSite={c.samesite}")
+                if c.secure:
+                    flags.append("Secure")
+                if c.httponly:
+                    flags.append("HttpOnly")
+                if c.samesite:
+                    flags.append(f"SameSite={c.samesite}")
                 flags_str = f" ({', '.join(flags)})" if flags else " (no flags)"
                 self.console.print(f"  {c.name}{flags_str}")
             if not self.verbose and len(self.result.cookies) > 5:
@@ -521,6 +585,10 @@ class NetScopeScanner:
                 if rules:
                     for rule in rules[:10]:
                         self.console.print(f"  {rule['type'].upper()}: {rule['path']}")
+                    if not self.verbose and len(rules) > 10:
+                        self.console.print(f"  ... and {len(rules) - 10} more")
+                else:
+                    self.console.print("  [dim]No Allow/Disallow rules[/dim]")
                 if r.get("sitemap"):
                     self.console.print(f"  Sitemap: {r['sitemap']}")
             else:
@@ -533,7 +601,8 @@ class NetScopeScanner:
             self._print_section_header("sitemap.xml")
             s = self.result.sitemap
             if s.get("exists"):
-                self.console.print(f"[green]Exists[/green] ({s.get('url_count', 0)} URLs)")
+                kind = "index" if s.get("is_index") else "sitemap"
+                self.console.print(f"[green]Exists[/green] ({kind}, {s.get('url_count', 0)} URLs)")
             else:
                 self.console.print("[dim]Not found[/dim]")
 
@@ -557,46 +626,42 @@ class NetScopeScanner:
             self._print_section_header("Technologies")
             for t in self.result.technologies:
                 self.console.print(f"[bold green]{t.name}[/bold green] ({t.category})")
-                if hasattr(t, 'evidence') and t.evidence:
+                if t.evidence:
                     self.console.print(f"  Evidence: {t.evidence}")
 
         # ═══════════════════════════════════════
         # RESPONSE HEADERS
         # ═══════════════════════════════════════
         if self.result.all_headers:
+            self._print_section_header("Response Headers")
             if self.verbose:
-                self._print_section_header("Response Headers")
                 for key, value in sorted(self.result.all_headers.items()):
                     self.console.print(f"[cyan]{key}:[/cyan] {value}")
             else:
-                # Compact: just show count
-                self._print_section_header("Response Headers")
-                self.console.print(f"{len(self.result.all_headers)} headers")
+                self.console.print(f"{len(self.result.all_headers)} headers (use -v to show)")
 
         # ═══════════════════════════════════════
         # ADDITIONAL INFORMATION
         # ═══════════════════════════════════════
         if self.result.additional_info:
-            self._print_section_header("Additional Information")
             add = self.result.additional_info
-            if add.alpn:
-                self.console.print(f"[bold cyan]ALPN[/bold cyan] {add.alpn}")
-            if add.keep_alive:
-                self.console.print(f"[bold cyan]Keep-Alive[/bold cyan] {add.keep_alive}")
-            if add.http3_support is not None:
-                self.console.print(f"[bold cyan]HTTP/3 Support[/bold cyan] {'Yes' if add.http3_support else 'No'}")
-            if add.ocsp_stapling is not None:
-                self.console.print(f"[bold cyan]OCSP Stapling[/bold cyan] {'Yes' if add.ocsp_stapling else 'No'}")
-            if add.session_resumption is not None:
-                self.console.print(f"[bold cyan]Session Resumption[/bold cyan] {'Yes' if add.session_resumption else 'No'}")
-            if add.alt_svc:
-                self.console.print(f"[bold cyan]Alt-Svc[/bold cyan] {add.alt_svc}")
-            if add.connection_reuse is not None:
-                self.console.print(f"[bold cyan]Connection Reuse[/bold cyan] {'Yes' if add.connection_reuse else 'No'}")
-            if add.content_encoding:
-                self.console.print(f"[bold cyan]Content-Encoding[/bold cyan] {add.content_encoding}")
-            if add.transfer_encoding:
-                self.console.print(f"[bold cyan]Transfer-Encoding[/bold cyan] {add.transfer_encoding}")
+            items = [
+                ("Keep-Alive", add.keep_alive),
+                ("Alt-Svc", add.alt_svc),
+                ("Content-Encoding", add.content_encoding),
+                ("Transfer-Encoding", add.transfer_encoding),
+            ]
+            bools = [
+                ("HTTP/3 Support", add.http3_support),
+            ]
+            if any(v for _, v in items) or any(v is not None for _, v in bools):
+                self._print_section_header("Additional Information")
+                for label, value in items:
+                    if value:
+                        self.console.print(f"[bold cyan]{label}[/bold cyan] {value}")
+                for label, value in bools:
+                    if value is not None:
+                        self.console.print(f"[bold cyan]{label}[/bold cyan] {'Yes' if value else 'No'}")
 
         # ═══════════════════════════════════════
         # RESPONSE TIMELINE
@@ -618,11 +683,12 @@ class NetScopeScanner:
                 ("Download", tl.download_ms),
                 ("Total", tl.total_ms),
             ]
-            max_label_len = max(len(l[0]) for l in labels)
+            max_label_len = max(len(lb[0]) for lb in labels)
 
             for label, val in labels:
-                dots = "." * (max(20, 30 - len(label)))
+                dots = "." * max(20, 30 - len(label))
                 self.console.print(f"{label:<{max_label_len}} {dots} {fmt_ms(val)}")
+            self.console.print("[dim]TTFB includes connection setup; Total covers the whole scan.[/dim]")
 
         # ═══════════════════════════════════════
         # RAW MODE
@@ -659,38 +725,70 @@ class NetScopeScanner:
             "INFO": [],
         }
 
+        # Header-based findings require an actual analyzed response
+        analyzed = bool(self.result.security_headers) and bool(self.result.all_headers)
         headers = {h.name: h for h in self.result.security_headers}
 
-        if not headers.get("HSTS") or not headers["HSTS"].present:
-            findings["HIGH"].append("Missing HSTS (HTTP Strict Transport Security)")
+        # A 4xx/5xx response is usually a block page or error page: the header
+        # verdict below describes that page, not what a real visitor gets.
+        status = self.result.status_code
+        if status is not None and status >= 400:
+            findings["INFO"].append(
+                f"Target answered HTTP {status} — findings describe that response, "
+                "not a normal page (the site may be blocking this scanner)"
+            )
 
-        if not headers.get("CSP") or not headers["CSP"].present:
-            findings["HIGH"].append("Missing CSP (Content Security Policy)")
+        if not analyzed:
+            findings["INFO"].append("Response headers unavailable — header checks skipped")
+        else:
+            if not self.is_https:
+                findings["INFO"].append("Site served over plain HTTP (no HSTS possible)")
+            elif not headers.get("HSTS") or not headers["HSTS"].present:
+                findings["HIGH"].append("Missing HSTS (HTTP Strict Transport Security)")
 
-        if not headers.get("X-Frame-Options") or not headers["X-Frame-Options"].present:
-            csp = headers.get("CSP")
-            if not csp or "frame-ancestors" not in (csp.value or "").lower():
-                findings["MEDIUM"].append("Missing X-Frame-Options or CSP frame-ancestors (clickjacking risk)")
+            if not headers.get("CSP") or not headers["CSP"].present:
+                findings["MEDIUM"].append("Missing CSP (Content Security Policy)")
 
-        if not headers.get("X-Content-Type-Options") or not headers["X-Content-Type-Options"].present:
-            findings["MEDIUM"].append("Missing X-Content-Type-Options (MIME sniffing risk)")
+            if not headers.get("X-Frame-Options") or not headers["X-Frame-Options"].present:
+                csp = headers.get("CSP")
+                if not csp or "frame-ancestors" not in (csp.value or "").lower():
+                    findings["MEDIUM"].append("Missing X-Frame-Options or CSP frame-ancestors (clickjacking risk)")
+
+            if not headers.get("X-Content-Type-Options") or not headers["X-Content-Type-Options"].present:
+                findings["MEDIUM"].append("Missing X-Content-Type-Options (MIME sniffing risk)")
+
+            for name in ("Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy"):
+                h = headers.get(name)
+                if not h or not h.present:
+                    findings["LOW"].append(f"Missing {name}")
 
         if self.result.tls:
-            if self.result.tls.version in ["TLSv1.0", "TLSv1.1"]:
-                findings["HIGH"].append(f"Weak TLS version: {self.result.tls.version}")
-            elif self.result.tls.version == "TLSv1.2":
+            tls = self.result.tls
+            if tls.version in ("TLSv1.0", "TLSv1.1"):
+                findings["HIGH"].append(f"Weak TLS version: {tls.version}")
+            elif tls.version == "TLSv1.2":
                 findings["MEDIUM"].append("TLS 1.2 supported (TLS 1.3 recommended)")
 
-            if self.result.tls.days_remaining is not None:
-                if self.result.tls.days_remaining < 0:
+            if tls.chain_valid is False and tls.verify_error:
+                findings["HIGH"].append(f"Certificate does not validate: {tls.verify_error}")
+
+            if tls.days_remaining is not None:
+                if tls.days_remaining < 0:
                     findings["HIGH"].append("TLS certificate expired")
-                elif self.result.tls.days_remaining < 7:
-                    findings["HIGH"].append(f"TLS certificate expires in {self.result.tls.days_remaining} days")
-                elif self.result.tls.days_remaining < 30:
-                    findings["MEDIUM"].append(f"TLS certificate expires in {self.result.tls.days_remaining} days")
+                elif tls.days_remaining < 7:
+                    findings["HIGH"].append(f"TLS certificate expires in {tls.days_remaining} days")
+                elif tls.days_remaining < 30:
+                    findings["MEDIUM"].append(f"TLS certificate expires in {tls.days_remaining} days")
         else:
-            if self.result.final_url and self.result.final_url.startswith("https"):
-                findings["HIGH"].append("HTTPS URL but TLS handshake failed")
+            # No TLS data: was the target HTTPS at all?
+            final = (self.result.final_url or "").lower()
+            target_https = final.startswith("https") or (not final and self.is_https)
+            if target_https:
+                # Only claim a failure if we actually attempted the handshake
+                if self._tls_checked:
+                    findings["HIGH"].append("HTTPS URL but TLS handshake failed")
+                else:
+                    findings["INFO"].append("TLS not inspected (target was entered as http://)")
 
         if self.result.cookies:
             for c in self.result.cookies:
@@ -702,7 +800,7 @@ class NetScopeScanner:
                     findings["LOW"].append(f"Cookie '{c.name}' missing SameSite attribute")
 
         server = (self.result.server_header or "").lower()
-        if server and any(x in server for x in ["nginx/", "apache/", "iis/", "microsoft-iis", "php/"]):
+        if any(x in server for x in ("nginx/", "apache/", "iis/", "microsoft-iis", "php/")):
             findings["LOW"].append(f"Server header reveals version: {self.result.server_header}")
 
         if self.result.ip_info and self.result.ip_info.ipv6:
@@ -714,9 +812,8 @@ class NetScopeScanner:
         if self.result.compression:
             findings["INFO"].append(f"Compression: {', '.join(self.result.compression)}")
 
-        if self.result.additional_info:
-            if self.result.additional_info.http3_support:
-                findings["INFO"].append("HTTP/3 supported (Alt-Svc header)")
+        if self.result.additional_info and self.result.additional_info.http3_support:
+            findings["INFO"].append("HTTP/3 supported (Alt-Svc header)")
 
         for severity in ["HIGH", "MEDIUM", "LOW", "INFO"]:
             items = findings[severity]
@@ -730,17 +827,22 @@ class NetScopeScanner:
             self.console.print("[dim]No security findings[/dim]")
 
     def _display_raw_mode(self):
-        """Display raw HTTP request and response."""
+        """Display the actual raw HTTP request and response."""
         self.console.print("[bold]HTTP Request:[/bold]")
-        self.console.print("GET / HTTP/1.1")
-        self.console.print(f"Host: {self.result.target}")
-        self.console.print("User-Agent: NetScope/1.0")
-        self.console.print("Accept: */*")
-        self.console.print("Connection: close")
+        method = self.result.request_method or "GET"
+        url = self.result.request_url or self.result.final_url or "/"
+        self.console.print(f"{method} {url} (as sent by httpx, HTTP/2+ style)")
+
+        req_headers = self.result.request_headers or {}
+        if req_headers:
+            for key, value in sorted(req_headers.items()):
+                self.console.print(f"{key}: {value}")
+        else:
+            self.console.print(f"Host: {self.result.target}")
         self.console.print()
 
         self.console.print("[bold]HTTP Response:[/bold]")
-        if self.result.http_version and self.result.status_code:
+        if self.result.http_version and self.result.status_code is not None:
             self.console.print(f"{self.result.http_version} {self.result.status_code}")
         for key, value in sorted(self.result.all_headers.items()):
             self.console.print(f"{key}: {value}")
@@ -748,12 +850,12 @@ class NetScopeScanner:
     def _export_markdown(self, export_dir: str):
         """Export scan results to Markdown file."""
         import os
-        from datetime import datetime
 
         os.makedirs(export_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{self.result.target}_{timestamp}.md"
+        safe_target = "".join(c if c.isalnum() or c in ".-_" else "_" for c in self.result.target)
+        filename = f"{safe_target}_{timestamp}.md"
         filepath = os.path.join(export_dir, filename)
 
         lines = []
@@ -777,9 +879,9 @@ class NetScopeScanner:
         lines.append("---")
         if self.result.http_version:
             lines.append(f"- **Version:** {self.result.http_version}")
-        if self.result.status_code:
+        if self.result.status_code is not None:
             lines.append(f"- **Status:** {self.result.status_code}")
-        if self.result.response_time_ms:
+        if self.result.response_time_ms is not None:
             lines.append(f"- **Response Time:** {self.result.response_time_ms:.2f} ms")
         if self.result.final_url:
             lines.append(f"- **Final URL:** {self.result.final_url}")
@@ -797,27 +899,43 @@ class NetScopeScanner:
                 lines.append(f"- **Cipher:** {tls.cipher}")
             if tls.issuer:
                 lines.append(f"- **Issuer:** {tls.issuer}")
+            if tls.chain_valid is not None:
+                verdict = "Valid" if tls.chain_valid else f"INVALID ({tls.verify_error})"
+                lines.append(f"- **Certificate:** {verdict}")
             if tls.days_remaining is not None:
                 lines.append(f"- **Days Remaining:** {tls.days_remaining}")
             if tls.fingerprint:
                 lines.append(f"- **Fingerprint:** `{tls.fingerprint}`")
         lines.append("")
 
-        lines.append("## Technologies")
-        lines.append("---")
+        if self.result.security_headers:
+            lines.append("## Security Headers")
+            lines.append("---")
+            for h in self.result.security_headers:
+                status = "✅" if h.present else "❌"
+                lines.append(f"- {status} **{h.name}** — {h.status}")
+            lines.append("")
+
         if self.result.technologies:
+            lines.append("## Technologies")
+            lines.append("---")
             for t in self.result.technologies:
                 lines.append(f"- **{t.name}** ({t.category})")
-        else:
-            lines.append("No technologies detected.")
-        lines.append("")
+            lines.append("")
 
-        lines.append("## Response Headers")
-        lines.append("---")
         if self.result.all_headers:
+            lines.append("## Response Headers")
+            lines.append("---")
             for key, value in sorted(self.result.all_headers.items()):
                 lines.append(f"- `{key}`: {value}")
-        lines.append("")
+            lines.append("")
+
+        if self.result.errors:
+            lines.append("## Errors")
+            lines.append("---")
+            for err in self.result.errors:
+                lines.append(f"- **{err.module}**: {err.error}")
+            lines.append("")
 
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))

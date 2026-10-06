@@ -1,8 +1,8 @@
-""" Security headers analysis module. """
+"""Security headers analysis module."""
 
+import re
 from typing import List, Dict
 from ..models import SecurityHeader
-
 
 # Header definitions with explanations and risk levels
 HEADER_DEFS = {
@@ -14,7 +14,7 @@ HEADER_DEFS = {
     "content-security-policy": {
         "name": "CSP",
         "explanation": "Controls resources the browser is allowed to load",
-        "risk": "high",
+        "risk": "medium",
     },
     "x-frame-options": {
         "name": "X-Frame-Options",
@@ -63,21 +63,27 @@ async def scan(headers: Dict[str, str]) -> List[SecurityHeader]:
         present = key in headers_lower
         value = headers_lower.get(key)
 
-        status = "present"
-        if not present:
-            status = "missing"
-        elif key == "strict-transport-security" and "max-age" not in (value or "").lower():
-            status = "weak"
-        elif key == "content-security-policy" and "default-src" not in (value or "").lower():
-            status = "partial"
+        status = "present" if present else "missing"
+        if present:
+            value_l = (value or "").lower()
+            if key == "strict-transport-security":
+                if "max-age" not in value_l:
+                    status = "weak"
+                elif re.search(r"max-age\s*=\s*0\b", value_l):
+                    # max-age=0 actively disables HSTS for this host
+                    status = "weak"
+            elif key == "content-security-policy" and ("default-src" not in value_l and "script-src" not in value_l):
+                status = "partial"
 
-        results.append(SecurityHeader(
-            name=meta["name"],
-            present=present,
-            value=value,
-            status=status,
-            explanation=meta["explanation"],
-            risk_level=meta["risk"],
-        ))
+        results.append(
+            SecurityHeader(
+                name=meta["name"],
+                present=present,
+                value=value,
+                status=status,
+                explanation=meta["explanation"],
+                risk_level=meta["risk"],
+            )
+        )
 
     return results

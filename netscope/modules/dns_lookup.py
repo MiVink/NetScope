@@ -1,4 +1,4 @@
-""" DNS lookup module using dnspython. """
+"""DNS lookup module using dnspython."""
 
 import asyncio
 import socket
@@ -7,63 +7,80 @@ import dns.resolver
 import dns.exception
 
 from ..models import DNSRecord, IPInfo
-from ..config import DNS_TIMEOUT, DNS_LIFETIME
+from ..config import DNS_TIMEOUT, DNS_LIFETIME, MAX_RETRIES, GEOIP_TIMEOUT, RETRY_BACKOFF
 
-async def scan(domain: str, max_retries: int = 3) -> List[DNSRecord]:
-    """Perform comprehensive DNS lookup with retry support."""
-    records = []
+
+async def scan(domain: str, max_retries: int = MAX_RETRIES) -> List[DNSRecord]:
+    """Perform comprehensive DNS lookup with retry support.
+
+    NXDOMAIN is raised to the caller (it is a real finding), while
+    "record type not present" is a normal, non-error condition.
+    """
+    records: List[DNSRecord] = []
     record_types = ["A", "AAAA", "MX", "TXT", "NS", "SOA", "CNAME"]
+    last_error: Exception | None = None
+
+    def _resolve(rtype: str) -> List[DNSRecord]:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = DNS_TIMEOUT
+        resolver.lifetime = DNS_LIFETIME
+        answer = resolver.resolve(domain, rtype, raise_on_no_answer=False)
+
+        found: List[DNSRecord] = []
+        ttl = answer.ttl if hasattr(answer, "ttl") else None
+        for rdata in answer:
+            value = str(rdata)
+            if rtype == "MX":
+                value = f"{rdata.preference} {rdata.exchange}"
+            elif rtype == "SOA":
+                value = f"{rdata.mname} (serial: {rdata.serial})"
+            found.append(DNSRecord(type=rtype, value=value, ttl=ttl))
+        return found
 
     for rtype in record_types:
         for attempt in range(1, max_retries + 1):
             try:
-                resolver = dns.resolver.Resolver()
-                resolver.timeout = DNS_TIMEOUT
-                resolver.lifetime = DNS_LIFETIME
+                # dnspython is blocking → run it off the event loop
+                records.extend(await asyncio.to_thread(_resolve, rtype))
+                break  # Success, no retry needed for this record type
 
-                answer = resolver.resolve(domain, rtype, raise_on_no_answer=False)
-
-                for rdata in answer:
-                    value = str(rdata)
-                    if rtype == "MX":
-                        value = f"{rdata.preference} {rdata.exchange}"
-                    elif rtype == "SOA":
-                        value = f"{rdata.mname} (serial: {rdata.serial})"
-
-                    records.append(DNSRecord(
-                        type=rtype,
-                        value=value,
-                        ttl=answer.ttl if hasattr(answer, 'ttl') else None
-                    ))
-                break  # Success, no retry needed
-
-            except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.resolver.NoAnswer):
-                # Permanent DNS errors — don't retry
+            except dns.resolver.NXDOMAIN:
+                # The domain itself does not exist — real finding, surface it
+                raise
+            except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+                # Record type not present / no usable nameservers for it — normal
                 break
-            except dns.exception.Timeout:
+            except (dns.exception.Timeout, OSError) as e:
+                last_error = e
                 if attempt < max_retries:
-                    await asyncio.sleep(0.5 * attempt)  # Exponential backoff
+                    await asyncio.sleep(RETRY_BACKOFF * attempt)
                     continue
                 break
-            except Exception:
+            except Exception as e:  # unexpected — do not hide it
+                last_error = e
                 break
+
+    if not records and last_error is not None:
+        # Nothing resolved at all: surface the underlying error instead of
+        # silently reporting "0 records ✔"
+        raise last_error
 
     return records
 
 
-async def get_ip_info(domain: str, max_retries: int = 3) -> IPInfo:
+async def get_ip_info(domain: str, max_retries: int = MAX_RETRIES) -> IPInfo:
     """Get IP information including CDN detection."""
     info = IPInfo()
 
     # IPv4
     for attempt in range(1, max_retries + 1):
         try:
-            answers = socket.getaddrinfo(domain, None, socket.AF_INET)
-            info.ipv4 = list(set(a[4][0] for a in answers))
+            answers = await asyncio.to_thread(socket.getaddrinfo, domain, None, socket.AF_INET)
+            info.ipv4 = list(dict.fromkeys(a[4][0] for a in answers))
             break
         except socket.gaierror:
             if attempt < max_retries:
-                await asyncio.sleep(0.5 * attempt)
+                await asyncio.sleep(RETRY_BACKOFF * attempt)
                 continue
             break
         except Exception:
@@ -72,12 +89,12 @@ async def get_ip_info(domain: str, max_retries: int = 3) -> IPInfo:
     # IPv6
     for attempt in range(1, max_retries + 1):
         try:
-            answers = socket.getaddrinfo(domain, None, socket.AF_INET6)
-            info.ipv6 = list(set(a[4][0] for a in answers))
+            answers = await asyncio.to_thread(socket.getaddrinfo, domain, None, socket.AF_INET6)
+            info.ipv6 = list(dict.fromkeys(a[4][0] for a in answers))
             break
         except socket.gaierror:
             if attempt < max_retries:
-                await asyncio.sleep(0.5 * attempt)
+                await asyncio.sleep(RETRY_BACKOFF * attempt)
                 continue
             break
         except Exception:
@@ -86,7 +103,8 @@ async def get_ip_info(domain: str, max_retries: int = 3) -> IPInfo:
     # CDN detection via reverse DNS of first IP
     if info.ipv4:
         try:
-            hostname = socket.gethostbyaddr(info.ipv4[0])[0].lower()
+            hostname = await asyncio.to_thread(socket.gethostbyaddr, info.ipv4[0])
+            hostname = hostname[0].lower()
             cdn_signatures = {
                 "cloudflare": "Cloudflare",
                 "akamai": "Akamai",
@@ -105,27 +123,30 @@ async def get_ip_info(domain: str, max_retries: int = 3) -> IPInfo:
         except Exception:
             pass
 
-    # Country detection (simplified via IP geolocation API)
+    # Country/ASN detection via a public IP geolocation API (best effort).
+    # Failure here is never fatal and never retried aggressively: it is a
+    # third-party service the user may be rate-limited by.
     if info.ipv4:
-        for attempt in range(1, max_retries + 1):
-            try:
-                import urllib.request
-                import json
-                req = urllib.request.Request(
-                    f"https://ipapi.co/{info.ipv4[0]}/json/",
-                    headers={"User-Agent": "NetScope/1.0"},
-                    method="GET"
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                    info.country = data.get("country_name") or data.get("country")
-                    info.provider = data.get("org")
-                    info.asn = data.get("asn")
-                break
-            except Exception:
-                if attempt < max_retries:
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-                break
+
+        def _geoip() -> dict:
+            import urllib.request
+            import json
+
+            req = urllib.request.Request(
+                f"https://ipapi.co/{info.ipv4[0]}/json/",
+                headers={"User-Agent": "NetScope/1.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=GEOIP_TIMEOUT) as resp:
+                return json.loads(resp.read())
+
+        try:
+            data = await asyncio.to_thread(_geoip)
+            if isinstance(data, dict) and not data.get("error"):
+                info.country = data.get("country_name") or data.get("country")
+                info.provider = data.get("org")
+                info.asn = data.get("asn")
+        except Exception:
+            pass
 
     return info

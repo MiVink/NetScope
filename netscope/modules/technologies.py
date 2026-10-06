@@ -1,58 +1,50 @@
-""" Technology detection module with evidence-based matching. """
+"""Technology detection module with evidence-based matching."""
 
 import re
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional
 from ..models import TechnologyInfo
+from ..config import MAX_BODY_SIZE, MODULE_TIMEOUT
 
-
-# Technology definitions: (name, category, evidence_rules)
-# Each rule is a tuple: (source, key_or_pattern, expected_value_or_pattern)
-# source can be: "header", "header_contains", "body", "body_contains"
+# Technology definitions: (name, category, evidence rules)
+# Rule sources:
+#   ("header",        header_name, regex)  → regex search in header value
+#   ("header_exists", header_name, None)   → header present at all
+#   ("body_regex",    pattern,       None) → regex search in page body
 TECHNOLOGIES = [
     # ─── Servers / CDNs ───
     {
         "name": "Nginx",
         "category": "Server",
-        "rules": [
-            ("header", "server", r"^nginx"),
-        ],
+        "rules": [("header", "server", r"^nginx")],
     },
     {
         "name": "Apache",
         "category": "Server",
-        "rules": [
-            ("header", "server", r"^apache"),
-        ],
+        "rules": [("header", "server", r"^apache")],
     },
     {
         "name": "IIS",
         "category": "Server",
-        "rules": [
-            ("header", "server", r"microsoft-iis"),
-        ],
+        "rules": [("header", "server", r"microsoft-iis")],
     },
     {
         "name": "LiteSpeed",
         "category": "Server",
-        "rules": [
-            ("header", "server", r"litespeed"),
-        ],
+        "rules": [("header", "server", r"litespeed")],
     },
     {
         "name": "Google Web Server",
         "category": "Server",
         "rules": [
-            ("header", "server", r"^gws"),
-            ("header", "server", r"^gse"),
-            ("header", "server", r"^google"),
+            ("header", "server", r"^(gws|gse|google)"),
         ],
     },
     {
         "name": "Cloudflare",
         "category": "CDN/WAF",
         "rules": [
-            ("header", "cf-ray", r"."),
-            ("header", "cf-cache-status", r"."),
+            ("header_exists", "cf-ray", None),
+            ("header_exists", "cf-cache-status", None),
             ("header", "server", r"cloudflare"),
         ],
     },
@@ -60,7 +52,7 @@ TECHNOLOGIES = [
         "name": "Akamai",
         "category": "CDN",
         "rules": [
-            ("header", "x-akamai-transformed", r"."),
+            ("header_exists", "x-akamai-transformed", None),
             ("header", "server", r"akamai"),
         ],
     },
@@ -68,15 +60,15 @@ TECHNOLOGIES = [
         "name": "Fastly",
         "category": "CDN",
         "rules": [
-            ("header", "x-fastly", r"."),
-            ("header", "fastly-debug-digest", r"."),
+            ("header_exists", "x-fastly", None),
+            ("header_exists", "fastly-debug-digest", None),
         ],
     },
     {
         "name": "AWS CloudFront",
         "category": "CDN",
         "rules": [
-            ("header", "x-amz-cf-id", r"."),
+            ("header_exists", "x-amz-cf-id", None),
             ("header", "via", r"cloudfront"),
         ],
     },
@@ -85,8 +77,8 @@ TECHNOLOGIES = [
         "category": "Hosting",
         "rules": [
             ("header", "server", r"vercel"),
-            ("header", "x-vercel-id", r"."),
-            ("header", "x-vercel-cache", r"."),
+            ("header_exists", "x-vercel-id", None),
+            ("header_exists", "x-vercel-cache", None),
         ],
     },
     {
@@ -94,62 +86,52 @@ TECHNOLOGIES = [
         "category": "Hosting",
         "rules": [
             ("header", "server", r"netlify"),
-            ("header", "x-nf-request-id", r"."),
+            ("header_exists", "x-nf-request-id", None),
         ],
     },
     {
         "name": "GitHub Pages",
         "category": "Hosting",
-        "rules": [
-            ("header", "server", r"github\.com"),
-        ],
+        "rules": [("header", "server", r"github\.com")],
     },
-
     # ─── Frameworks / Languages ───
     {
         "name": "PHP",
         "category": "Language",
-        "rules": [
-            ("header", "x-powered-by", r"php"),
-        ],
+        "rules": [("header", "x-powered-by", r"php")],
     },
     {
         "name": "ASP.NET",
         "category": "Framework",
         "rules": [
-            ("header", "x-aspnet-version", r"."),
+            ("header_exists", "x-aspnet-version", None),
             ("header", "x-powered-by", r"asp\.net"),
         ],
     },
     {
         "name": "Express",
         "category": "Framework",
-        "rules": [
-            ("header", "x-powered-by", r"express"),
-        ],
+        "rules": [("header", "x-powered-by", r"express")],
     },
     {
         "name": "WordPress",
         "category": "CMS",
         "rules": [
-            ("body_contains", "wp-content", None),
-            ("body_contains", "wp-includes", None),
+            ("body_regex", r"/wp-content/|/wp-includes/", None),
             ("header", "x-powered-by", r"wordpress"),
         ],
     },
     {
         "name": "Laravel",
         "category": "Framework",
-        "rules": [
-            ("header", "set-cookie", r"laravel_session"),
-        ],
+        "rules": [("header", "set-cookie", r"laravel_session")],
     },
     {
         "name": "Next.js",
         "category": "Framework",
         "rules": [
             ("header", "x-powered-by", r"next\.js"),
-            ("body_contains", "__next", None),
+            ("body_regex", r"__NEXT_DATA__|/_next/static/", None),
         ],
     },
     {
@@ -157,128 +139,126 @@ TECHNOLOGIES = [
         "category": "Framework",
         "rules": [
             ("header", "x-powered-by", r"nuxt"),
+            ("body_regex", r"__NUXT__|/_nuxt/", None),
         ],
     },
-
     # ─── Frontend ───
     {
         "name": "React",
         "category": "Frontend",
         "rules": [
-            ("body_contains", "data-reactroot", None),
-            ("body_contains", "data-reactid", None),
-            ("body_contains", "reactroot", None),
+            ("body_regex", r"data-react(root|id)=|__REACT_DEVTOOLS", None),
         ],
     },
     {
         "name": "Vue.js",
         "category": "Frontend",
         "rules": [
-            ("body_contains", "__vue", None),
-            ("body_contains", "data-v-", None),
+            ("body_regex", r"data-v-[0-9a-f]{6,}|__vue__|Vue\.config|__VUE__", None),
         ],
     },
     {
         "name": "Angular",
         "category": "Frontend",
         "rules": [
-            ("body_contains", "ng-version", None),
-            ("body_contains", "ng-app", None),
+            ("body_regex", r"ng-version=|ng-app[ =]|_nghost", None),
         ],
     },
     {
         "name": "jQuery",
         "category": "Library",
         "rules": [
-            ("body_contains", "jquery", None),
+            ("body_regex", r"jquery[.-]\d+\.\d+|jquery\.min\.js", None),
         ],
     },
     {
         "name": "Bootstrap",
         "category": "CSS Framework",
         "rules": [
-            ("body_contains", "bootstrap", None),
+            ("body_regex", r"bootstrap[.-]\d+\.\d+|bootstrap\.min\.(css|js)", None),
         ],
     },
     {
         "name": "Tailwind CSS",
         "category": "CSS Framework",
         "rules": [
-            ("body_contains", "tailwind", None),
+            ("body_regex", r"cdn\.tailwindcss\.com|tailwind\.min\.css|/tailwindcss@", None),
         ],
     },
-
     # ─── Analytics ───
     {
         "name": "Google Analytics",
         "category": "Analytics",
         "rules": [
-            ("body_contains", "google-analytics", None),
-            ("body_contains", "gtag", None),
-            ("body_contains", "googletagmanager", None),
+            ("body_regex", r"google-analytics\.com/(analytics|ga)\.js|googletagmanager\.com/gtm\.js|gtag\(", None),
         ],
     },
 ]
 
 
-async def scan(url: str, headers: Dict[str, str], server_header: str) -> List[TechnologyInfo]:
-    """Detect technologies with evidence-based matching."""
-    detected = []
+def detect(
+    headers: Dict[str, str],
+    body: str = "",
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> List[TechnologyInfo]:
+    """Pure, side-effect-free technology detection from headers + body."""
     headers_lower = {k.lower(): v for k, v in headers.items()}
+    for k, v in (extra_headers or {}).items():
+        if k.lower() not in headers_lower:
+            headers_lower[k.lower()] = v
+    body_l = (body or "").lower()
 
-    # Fetch page content for body-based detection
+    detected: List[TechnologyInfo] = []
+    for tech in TECHNOLOGIES:
+        evidence: List[str] = []
+
+        for source, key, pattern in tech["rules"]:
+            if source == "header":
+                header_value = headers_lower.get(key, "")
+                if header_value and re.search(pattern, header_value, re.IGNORECASE):
+                    evidence.append(f"{key}: {header_value}")
+            elif source == "header_exists":
+                if key in headers_lower:
+                    evidence.append(f"{key}: {headers_lower[key]}")
+            elif source == "body_regex" and body_l:
+                match = re.search(key, body_l, re.IGNORECASE)
+                if match:
+                    evidence.append(f"Body matches: {match.group(0)[:60]}")
+
+        if evidence:
+            detected.append(
+                TechnologyInfo(
+                    name=tech["name"],
+                    category=tech["category"],
+                    evidence="; ".join(evidence[:2]),
+                )
+            )
+
+    return detected
+
+
+async def scan(
+    url: str,
+    headers: Dict[str, str],
+    server_header: str = "",
+) -> List[TechnologyInfo]:
+    """Fetch page content (bounded) and detect technologies."""
     page_content = ""
     try:
         import httpx
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            response = await client.get(url)
-            page_content = response.text.lower()[:100000]
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=MODULE_TIMEOUT) as client:
+            async with client.stream("GET", url) as response:
+                chunks = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= MAX_BODY_SIZE:
+                        break
+                page_content = b"".join(chunks).decode("utf-8", errors="replace")
     except Exception:
         pass
 
-    for tech in TECHNOLOGIES:
-        evidence_list = []
-        matched = False
-
-        for rule in tech["rules"]:
-            source, key, pattern = rule
-
-            if source == "header":
-                # Exact header match with regex
-                header_value = headers_lower.get(key, "")
-                if header_value and re.search(pattern, header_value, re.IGNORECASE):
-                    evidence_list.append(f"{key}: {header_value}")
-                    matched = True
-
-            elif source == "header_contains":
-                # Header contains substring
-                header_value = headers_lower.get(key, "")
-                if header_value and pattern.lower() in header_value.lower():
-                    evidence_list.append(f"{key}: {header_value}")
-                    matched = True
-
-            elif source == "body_contains":
-                # Body contains substring
-                if page_content and key.lower() in page_content:
-                    evidence_list.append(f"Body contains: '{key}'")
-                    matched = True
-
-        if matched:
-            # Build evidence string
-            evidence = "; ".join(evidence_list[:2])  # Show first 2 pieces of evidence
-            detected.append(TechnologyInfo(
-                name=tech["name"],
-                category=tech["category"],
-            ))
-            # Store evidence on the object dynamically
-            detected[-1].evidence = evidence
-
-    # Remove duplicates (keep first match)
-    seen = set()
-    unique = []
-    for t in detected:
-        if t.name not in seen:
-            seen.add(t.name)
-            unique.append(t)
-
-    return unique
+    extra = {"server": server_header} if server_header else None
+    return detect(headers, page_content, extra_headers=extra)

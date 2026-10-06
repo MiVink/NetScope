@@ -1,38 +1,47 @@
-""" Redirect chain analysis module. """
+"""Redirect chain analysis module."""
 
 import httpx
 from typing import List
+from urllib.parse import urljoin
+
 from ..models import RedirectInfo
+from ..config import MODULE_TIMEOUT, MAX_REDIRECTS
 
 
 async def scan(url: str) -> List[RedirectInfo]:
-    """Trace redirect chain."""
-    chain = []
+    """Trace redirect chain (loop-safe, bounded by MAX_REDIRECTS)."""
+    chain: List[RedirectInfo] = []
+    seen: set = set()
 
-    async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=MODULE_TIMEOUT) as client:
         current_url = url
-        step = 0
 
-        for _ in range(10):  # Max 10 redirects
+        for step in range(MAX_REDIRECTS + 1):
+            if current_url in seen:
+                break  # redirect loop
+            seen.add(current_url)
+
             try:
                 response = await client.get(current_url)
-                chain.append(RedirectInfo(
+            except Exception:
+                if not chain:
+                    raise  # the first request failing is a real error
+                break
+
+            chain.append(
+                RedirectInfo(
                     step=step,
                     url=str(current_url),
-                    status_code=response.status_code
-                ))
+                    status_code=response.status_code,
+                )
+            )
 
-                if response.status_code in (301, 302, 307, 308, 303):
-                    location = response.headers.get("location")
-                    if location:
-                        from urllib.parse import urljoin
-                        current_url = urljoin(current_url, location)
-                        step += 1
-                    else:
-                        break
-                else:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                if not location:
                     break
-            except Exception:
+                current_url = urljoin(current_url, location)
+            else:
                 break
 
     return chain

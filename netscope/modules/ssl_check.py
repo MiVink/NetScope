@@ -1,20 +1,39 @@
-""" SSL/TLS certificate inspection module. """
+"""SSL/TLS certificate inspection module."""
 
-import asyncio
-import ssl
 import socket
+import ssl
 import hashlib
 from datetime import datetime, timezone
 from cryptography import x509
-from cryptography.hazmat.backends import default_backend
 
 from ..models import TLSInfo
-from ..config import TCP_TIMEOUT
+from ..config import TCP_TIMEOUT, TLS_TIMEOUT
+
+
+def _validate_certificate(domain: str, port: int = 443) -> tuple:
+    """Second handshake with full certificate validation enabled.
+
+    Returns (chain_valid, verify_error). chain_valid is True only when the
+    default trust store accepts the chain and the hostname matches.
+    """
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((domain, port), timeout=TLS_TIMEOUT) as sock:
+            with context.wrap_socket(sock, server_hostname=domain):
+                return True, None
+    except ssl.SSLCertVerificationError as e:
+        return False, str(e)
+    except (OSError, ssl.SSLError) as e:
+        # Could not check (network/TLS problem) — not a certificate verdict
+        return None, str(e)
+
 
 async def scan(domain: str, port: int = 443) -> TLSInfo:
     """Analyze TLS certificate and connection with detailed extensions."""
     info = TLSInfo()
 
+    # Inspection context: no verification, so broken/self-signed certs can be
+    # examined instead of aborting. Validation happens separately below.
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE  # Allow self-signed for inspection
@@ -41,49 +60,37 @@ async def scan(domain: str, port: int = 443) -> TLSInfo:
                 # Certificate
                 cert_der = ssock.getpeercert(binary_form=True)
                 if cert_der:
-                    cert = x509.load_der_x509_certificate(cert_der, default_backend())
+                    cert = x509.load_der_x509_certificate(cert_der)
 
-                    # Subject
-                    subject = cert.subject
-                    info.subject = ", ".join([f"{attr.oid._name}={attr.value}" for attr in subject])
+                    # Subject / issuer (rfc4514 gives "CN=..., O=..." form)
+                    info.subject = ", ".join(f"{attr.rfc4514_attribute_name}={attr.value}" for attr in cert.subject)
+                    info.issuer = ", ".join(f"{attr.rfc4514_attribute_name}={attr.value}" for attr in cert.issuer)
 
-                    # Issuer
-                    issuer = cert.issuer
-                    info.issuer = ", ".join([f"{attr.oid._name}={attr.value}" for attr in issuer])
-
-                    # Dates — use modern UTC-aware API
+                    # Dates — use modern UTC-aware API when available
                     try:
-                        info.valid_from = cert.not_valid_before_utc.replace(tzinfo=None)
-                        info.valid_until = cert.not_valid_after_utc.replace(tzinfo=None)
+                        valid_from = cert.not_valid_before_utc
+                        valid_until = cert.not_valid_after_utc
                     except AttributeError:
                         # Fallback for older cryptography versions
-                        info.valid_from = cert.not_valid_before
-                        info.valid_until = cert.not_valid_after
+                        valid_from = cert.not_valid_before.replace(tzinfo=timezone.utc)
+                        valid_until = cert.not_valid_after.replace(tzinfo=timezone.utc)
 
-                    # Days remaining
-                    now = datetime.now()
-                    if info.valid_until:
-                        info.days_remaining = (info.valid_until - now).days
+                    # Days remaining, computed against UTC (not local time)
+                    info.days_remaining = (valid_until - datetime.now(timezone.utc)).days
+
+                    info.valid_from = valid_from.replace(tzinfo=None)
+                    info.valid_until = valid_until.replace(tzinfo=None)
 
                     # Fingerprint
                     info.fingerprint = hashlib.sha256(cert_der).hexdigest()
 
-                # OCSP Stapling detection
-                try:
-                    ocsp_response = ssock.getpeercert(chain=True)
-                    # OCSP stapling is present if there's an OCSP response in the chain
-                    # Simplified: check if SSL context would have stapled
-                    info.ocsp_stapling = False  # Will be refined if we can detect it
-                except Exception:
-                    pass
+                # OCSP stapling / session resumption cannot be determined with
+                # the Python standard library alone — not reported at all
+                # rather than being shown as a false "No".
+    except (OSError, ssl.SSLError) as e:
+        raise RuntimeError(f"SSL error: {e}") from e
 
-                # Session resumption
-                try:
-                    # Try to reconnect and see if session is reused
-                    info.session_resumption = False
-                except Exception:
-                    pass
-    except Exception as e:
-        raise Exception(f"SSL error: {e}")
+    # Separate handshake with verification enabled → real verdict on the cert
+    info.chain_valid, info.verify_error = _validate_certificate(domain, port)
 
     return info
